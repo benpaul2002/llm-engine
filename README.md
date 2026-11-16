@@ -1,7 +1,7 @@
 # llm-engine
 
 An inference engine for Qwen2.5, written in PyTorch.
-Implements a paged KV cache with prefix caching, continuous batching, and speculative decoding. 
+Implements a paged KV cache with prefix caching, continuous batching, speculative decoding, and a CUDA paged-attention kernel for decode.
 Pretrained weights and tokenizer from HuggingFace.
 
 Hardware - RTX 4060 GPU, 8GB VRAM.
@@ -11,6 +11,7 @@ Models used: Qwen2.5-0.5B-Instruct (draft), Qwen2.5-1.5B-Instruct (target)
 ```
 model.py      forward pass: RMSNorm, RoPE, GQA attention, SwiGLU, tied head
 cache.py      paged KV cache: block pool, block tables, refcounts, prefix registry
+attn_kernel.cu  CUDA decode attention, reads K/V through the block table
 scheduler.py  continuous batching: admission, preemption, eviction
 spec.py       speculative decoding
 bench.py      wall-clock benchmarks (TTFT, inter-token latency, throughput)
@@ -70,3 +71,14 @@ A batch-8 decode step costs only 1.4x a batch-1 step but serves 8 sequences, so 
 Used the smaller (0.5B) model as a draft model for the target (1.5B) model. Draft model produces k=4 proposal tokens, target model goes through all k at once and greedily picks all that match. Ran three prompts - 56 tokens from 19 target passes (2.95x fewer than one pass per token). Acceptance rate of 0.52. Output is token-identical to the target decoding alone.
 
 However, it's slower - 0.81x, 0.80x, 1.20x on those three prompts. This is because at batch 1, cost is dominated by launch overhead rather than FLOPs. A larger target would show a speedup, however this isn't possible here due to memory constraints.
+
+**Paged-attention kernel**
+
+Decode attention originally gathered each sequence's K/V into a padded dense tensor, expanded the KV heads for GQA, then called SDPA. The CUDA kernel instead reads K/V straight from the block pool through each sequence's block table, and maps each query head to its KV head by index. One GPU block per (sequence, query head), one thread per head dimension.
+
+| | attention @1, 1024 ctx | attention @16, 112 ctx | decode step @16 |
+|---|---|---|---|
+| gather + SDPA | 0.09 ms | 0.51 ms | 20.9 ms |
+| kernel | 0.59 ms | 0.09 ms | 11.5 ms |
+
+Faster as the batch grows, but slower for a single long context, since tokens are processed one at a time.
