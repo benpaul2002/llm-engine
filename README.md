@@ -61,10 +61,10 @@ Time to first token, and per-token cost as the batch grows:
 
 | | TTFT 512 tok | ms/step @1 | ms/step @8 |
 |---|---|---|---|
-| 0.5B | 32.0 | 11.5 | 16.5 |
-| 1.5B | 85.8 | 20.7 | 27.1 |
+| 0.5B | 31.9 | 10.2 | 11.6 |
+| 1.5B | 85.9 | 19.2 | 20.5 |
 
-A batch-8 decode step costs only 1.4x a batch-1 step but serves 8 sequences, so per-token cost drops 6x. Throughput follows: 47 tok/s at 1 request, 156 tok/s at 8 (1.5B).
+A batch-8 decode step costs only 1.07x a batch-1 step but serves 8 sequences, so per-token cost drops 7.5x. Throughput follows: 51 tok/s at 1 request, 176 tok/s at 8 (1.5B).
 
 **Speculative decoding** 
 
