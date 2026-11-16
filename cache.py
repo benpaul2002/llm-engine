@@ -11,6 +11,8 @@ class DecodePlan:
     mask: torch.Tensor
     max_len: int
     lengths: list[int]
+    lengths_gpu: torch.Tensor
+    table: torch.Tensor
 
 @dataclass
 class CacheStats:
@@ -190,11 +192,16 @@ class KVCache:
             gather_block_ids.append(block_ids)
             gather_offsets.append(offsets)
         lengths = [seq.length for seq in seq_list]
-        lengths_t = torch.tensor(lengths, device=device)
+        lengths_t = torch.tensor(lengths, device=device, dtype=torch.int32)
         positions = torch.arange(max_len, device=device)
         mask = positions[None, :] < lengths_t[:, None]
         mask = mask[:, None, None, :]
-        return DecodePlan(gather_block_ids, gather_offsets, scatter_block_ids, scatter_offsets, mask, max_len, lengths)
+        max_blocks = max(len(s.block_table) for s in seq_list)
+        table = torch.tensor(
+            [s.block_table + [-1] * (max_blocks - len(s.block_table)) for s in seq_list],
+            dtype=torch.int32, device=device,
+        )
+        return DecodePlan(gather_block_ids, gather_offsets, scatter_block_ids, scatter_offsets, mask, max_len, lengths, lengths_t, table)
 
     def scatter_prefill(self, seq, layer_idx, k_new, v_new):
         num_new_tokens = k_new.shape[2]

@@ -89,7 +89,12 @@ BATCH_DECODE_STEPS = 12
 #   correct                    max abs diff  0.25 - 0.84
 #   padding mask dropped                     5.50 - 14.09
 #   RoPE positions off by one                8.97 - 15.89
-MAX_BATCH_ABS_DIFF = 2.0
+#
+# Raised from 2.0 for the CUDA paged-attention decode kernel. One step of
+# 'What is 2+2?' is unusually sensitive: with exact float64 attention
+# (rounded to bf16) it reaches 2.79, the kernel 2.88-3.01, and SDPA happened
+# to land at 0.84. 3.5 clears that step and stays under the 5.5 bug floor.
+MAX_BATCH_ABS_DIFF = 3.5
 
 # A position is "decisive" if fp32's top-2 gap exceeds this. One bf16 ulp is
 # ~0.25, so 1.0 is well outside what rounding could flip.

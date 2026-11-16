@@ -1,10 +1,20 @@
 from dataclasses import dataclass
 import json
 from safetensors import safe_open
+import os
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.9")
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 from cache import KVCache, Sequence
+from torch.utils.cpp_extension import load_inline
+
+mod = load_inline(
+    name="attn_ext",
+    cpp_sources="void attention(torch::Tensor q, torch::Tensor kpool, torch::Tensor vpool, torch::Tensor table, torch::Tensor lengths, torch::Tensor out);",
+    cuda_sources=open("attn_kernel.cu").read(),
+    functions=["attention"],
+)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -106,13 +116,14 @@ def gqa_attention(x, weights, layer_idx, config, cos, sin, kvcache, seq_list, pr
     if prefillFlag:
         kvcache.scatter_prefill(seq_list[0], layer_idx, k_out, v)
         k_out, v = kvcache.gather_prefill(seq_list[0], layer_idx)
+        k_out = torch.repeat_interleave(k_out, n_heads//n_kv_heads, dim=1)
+        v = torch.repeat_interleave(v, n_heads//n_kv_heads, dim=1)
+        x = F.scaled_dot_product_attention(q_out, k_out, v, attn_mask=attn_mask, is_causal=(attn_mask is None))
     else:
         kvcache.scatter_decode(decodePlan, layer_idx, k_out, v)
-        k_out, v, attn_mask = kvcache.gather_decode(decodePlan, layer_idx)
-
-    k_out = torch.repeat_interleave(k_out, n_heads//n_kv_heads, dim=1)
-    v = torch.repeat_interleave(v, n_heads//n_kv_heads, dim=1)
-    x = F.scaled_dot_product_attention(q_out, k_out, v, attn_mask=attn_mask, is_causal=(attn_mask is None))
+        x = torch.empty_like(q_out)
+        mod.attention(q_out, kvcache.k[layer_idx], kvcache.v[layer_idx], decodePlan.table, decodePlan.lengths_gpu, x)
+    
     x = x.transpose(1, 2).reshape(batch_size, seq_len, config.hidden_size)
     return F.linear(x, o_w)
 
