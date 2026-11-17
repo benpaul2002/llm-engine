@@ -18,19 +18,21 @@ __global__ void attn_kernel(at::BFloat16* q, at::BFloat16* kpool, at::BFloat16* 
 
     __shared__ float partial[128];
 
-    for(int t=0; t<l; t++) {
+    int warp = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    int num_warps = head_dim/32;
+    for(int t=warp; t<l; t+=num_warps) {
+        float val = 0;
         int cache_block = table[seq*max_blocks + t/block_size];
         int slot = t % block_size;
-        partial[i] = (float)q[i] * (float)kpool[((cache_block*block_size + slot)*num_kv_heads + kv_head)*head_dim + i];
-        for(int j=head_dim/2; j>=1; j/=2) {
-            __syncthreads();
-            if(i<j) {
-                partial[i] += partial[i+j];
-            }
+        for(int d=lane; d<head_dim; d+=32) {
+            val += (float)q[d] * (float)kpool[((cache_block*block_size + slot)*num_kv_heads + kv_head)*head_dim + d];
         }
-        __syncthreads();
-        if(i==0) {
-            scores[t] = partial[0]/sqrtf((float)head_dim);
+        for(int offset=16; offset>=1; offset/=2) {
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        }
+        if(lane==0) {
+            scores[t] = val/sqrtf(head_dim);
         }
     }
     __syncthreads();
