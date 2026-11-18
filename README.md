@@ -74,11 +74,14 @@ However, it's slower - 0.81x, 0.80x, 1.20x on those three prompts. This is becau
 
 **Paged-attention kernel**
 
-Decode attention originally gathered each sequence's K/V into a padded dense tensor, expanded the KV heads for GQA, then called SDPA. The CUDA kernel instead reads K/V straight from the block pool through each sequence's block table, and maps each query head to its KV head by index. One GPU block per (sequence, query head), one thread per head dimension.
+Decode attention originally gathered each sequence's K/V into a padded dense tensor, expanded the KV heads for GQA, then called SDPA. The CUDA kernel instead reads K/V straight from the block pool through each sequence's block table, and maps each query head to its KV head by index. Each (sequence, query head) is split across 4 GPU blocks by token range (split-K). Within a block, each warp scores its own tokens and reduces the dot product with warp shuffles. Each block writes its partial softmax and a second kernel rescales and combines them.
 
-| | attention @1, 1024 ctx | attention @16, 112 ctx | decode step @16 |
+Attention time per layer, gather + SDPA vs kernel:
+
+| | batch 1, 2048 ctx | batch 8, 256 ctx | batch 64, 32 ctx |
 |---|---|---|---|
-| gather + SDPA | 0.09 ms | 0.51 ms | 20.9 ms |
-| kernel | 0.59 ms | 0.09 ms | 11.5 ms |
+| 0.5B | 0.200 → 0.200 ms (1.0x) | 0.266 → 0.049 ms (5.4x) | 1.85 → 0.049 ms (37x) |
+| 1.5B | 0.192 → 0.097 ms (2.0x) | 0.285 → 0.047 ms (6.1x) | 1.75 → 0.066 ms (26x) |
 
-Faster as the batch grows, but slower for a single long context, since tokens are processed one at a time.
+The speed increase grows with batch size, since the old path gathered each sequence separately. 
+
