@@ -12,7 +12,7 @@ from torch.utils.cpp_extension import load_inline
 mod = load_inline(
     name="attn_ext",
     cpp_sources="void attention(torch::Tensor q, torch::Tensor kpool, torch::Tensor vpool, torch::Tensor table, torch::Tensor lengths, torch::Tensor out);",
-    cuda_sources=open("attn_kernel.cu").read(),
+    cuda_sources=open(os.path.join(os.path.dirname(__file__), "attn_kernel.cu")).read(),
     functions=["attention"],
 )
 
