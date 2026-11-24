@@ -91,18 +91,18 @@ def apply_rope(q, k, cos, sin):
     k_out = (k*cos + rotate_half(k)*sin).to(dtype)
     return q_out, k_out
 
-def gqa_attention(x, weights, layer_idx, config, cos, sin, kvcache, seq_list, prefillFlag, attn_mask, decodePlan):
-    q_w = weights[f"model.layers.{layer_idx}.self_attn.q_proj.weight"]
-    q_b = weights[f"model.layers.{layer_idx}.self_attn.q_proj.bias"]
-    k_w = weights[f"model.layers.{layer_idx}.self_attn.k_proj.weight"]
-    k_b = weights[f"model.layers.{layer_idx}.self_attn.k_proj.bias"]
-    v_w = weights[f"model.layers.{layer_idx}.self_attn.v_proj.weight"]
-    v_b = weights[f"model.layers.{layer_idx}.self_attn.v_proj.bias"]
-    o_w = weights[f"model.layers.{layer_idx}.self_attn.o_proj.weight"]
+def linear(x, weights, name, adapters):
+    out = F.linear(x, weights[name + ".weight"], weights.get(name + ".bias"))
+    if adapters is not None and name in adapters:
+        A, B = adapters[name]
+        out = out + torch.bmm(torch.bmm(x, B), A.transpose(1, 2))
+    return out
 
-    q = F.linear(x, q_w, q_b)
-    k = F.linear(x, k_w, k_b)
-    v = F.linear(x, v_w, v_b)
+def gqa_attention(x, weights, layer_idx, config, cos, sin, kvcache, seq_list, prefillFlag, attn_mask, decodePlan, adapters=None):
+    p = f"model.layers.{layer_idx}.self_attn."
+    q = linear(x, weights, p + "q_proj", adapters)
+    k = linear(x, weights, p + "k_proj", adapters)
+    v = linear(x, weights, p + "v_proj", adapters)
 
     batch_size, seq_len, _ = x.shape
     n_heads = config.num_attention_heads
@@ -125,24 +125,23 @@ def gqa_attention(x, weights, layer_idx, config, cos, sin, kvcache, seq_list, pr
         mod.attention(q_out, kvcache.k[layer_idx], kvcache.v[layer_idx], decodePlan.table, decodePlan.lengths_gpu, x)
     
     x = x.transpose(1, 2).reshape(batch_size, seq_len, config.hidden_size)
-    return F.linear(x, o_w)
+    return linear(x, weights, p + "o_proj", adapters)
 
-def swiglu(x, weights, layer_idx):
-    g_w = weights[f"model.layers.{layer_idx}.mlp.gate_proj.weight"]
-    u_w = weights[f"model.layers.{layer_idx}.mlp.up_proj.weight"]
-    d_w = weights[f"model.layers.{layer_idx}.mlp.down_proj.weight"]
-    return F.linear(F.silu(F.linear(x, g_w)) * F.linear(x, u_w), d_w)
+def swiglu(x, weights, layer_idx, adapters=None):
+    p = f"model.layers.{layer_idx}.mlp."
+    h = F.silu(linear(x, weights, p + "gate_proj", adapters)) * linear(x, weights, p + "up_proj", adapters)
+    return linear(h, weights, p + "down_proj", adapters)
 
-def decoder_layer(x, weights, layer_idx, config, cos, sin, kvcache, seq_list, prefillFlag, attn_mask, decodePlan):
+def decoder_layer(x, weights, layer_idx, config, cos, sin, kvcache, seq_list, prefillFlag, attn_mask, decodePlan, adapters=None):
     input_layernorm_weight = weights[f"model.layers.{layer_idx}.input_layernorm.weight"]
     post_attention_layernorm_weight = weights[f"model.layers.{layer_idx}.post_attention_layernorm.weight"]
     eps = config.rms_norm_eps
-    h = x + gqa_attention(rmsnorm(x, input_layernorm_weight, eps), weights, layer_idx, config, cos, sin, kvcache, seq_list, prefillFlag, attn_mask, decodePlan)
-    out = h + swiglu(rmsnorm(h, post_attention_layernorm_weight, eps), weights, layer_idx)
+    h = x + gqa_attention(rmsnorm(x, input_layernorm_weight, eps), weights, layer_idx, config, cos, sin, kvcache, seq_list, prefillFlag, attn_mask, decodePlan, adapters)
+    out = h + swiglu(rmsnorm(h, post_attention_layernorm_weight, eps), weights, layer_idx, adapters)
     return out
 
 @torch.inference_mode()
-def forward_prefill(token_ids, weights, config, cos, sin, kvcache, seq_list):
+def forward_prefill(token_ids, weights, config, cos, sin, kvcache, seq_list, adapters=None):
     seq = seq_list[0]
     batch_size, seq_len = token_ids.shape
     kvcache.ensure_capacity(seq, seq_len)
@@ -158,12 +157,12 @@ def forward_prefill(token_ids, weights, config, cos, sin, kvcache, seq_list):
     if seq.length-seq_len > 0:
         attn_mask = k_pos <= q_pos
     for i in range(config.num_hidden_layers):
-        x = decoder_layer(x, weights, i, config, cos_pos, sin_pos, kvcache, seq_list, True, attn_mask, None)
+        x = decoder_layer(x, weights, i, config, cos_pos, sin_pos, kvcache, seq_list, True, attn_mask, None, adapters)
     x = rmsnorm(x, weights["model.norm.weight"], config.rms_norm_eps)
     return F.linear(x, weights["model.embed_tokens.weight"])
 
 @torch.inference_mode()
-def forward_decode(token_ids, weights, config, cos, sin, kvcache, seq_list):
+def forward_decode(token_ids, weights, config, cos, sin, kvcache, seq_list, adapters=None):
     batch_size, seq_len = token_ids.shape
     for seq in seq_list:
         kvcache.ensure_capacity(seq, seq_len)
@@ -175,7 +174,7 @@ def forward_decode(token_ids, weights, config, cos, sin, kvcache, seq_list):
     sin_pos = sin[positions]
     decodePlan = kvcache.plan_decode(seq_list, cos.device)
     for i in range(config.num_hidden_layers):
-        x = decoder_layer(x, weights, i, config, cos_pos, sin_pos, kvcache, seq_list, False, None, decodePlan)
+        x = decoder_layer(x, weights, i, config, cos_pos, sin_pos, kvcache, seq_list, False, None, decodePlan, adapters)
     x = rmsnorm(x, weights["model.norm.weight"], config.rms_norm_eps)
     return F.linear(x, weights["model.embed_tokens.weight"])
 

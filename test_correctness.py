@@ -2154,6 +2154,44 @@ def _indent(text):
     return "\n".join("  " + line for line in text.splitlines())
 
 
+def check_adapters(snapshot_path, engine, device="cuda", rows=4, sigma=1e-3, prefill_len=24):
+    config, weights, cos, sin = engine
+    ids = tokenize(snapshot_path, PROMPT, device)
+    pre, dec = ids[:, :prefill_len], ids[0, prefill_len:]
+    g = torch.Generator(device=device).manual_seed(0)
+    adapters = {}
+    for n in [k[:-7] for k in weights if k.endswith("_proj.weight")]:
+        out_f, in_f = weights[n + ".weight"].shape
+        adapters[n] = (sigma * torch.randn(rows, out_f, 1, generator=g, device=device, dtype=torch.bfloat16),
+                       torch.randn(rows, in_f, 1, generator=g, device=device, dtype=torch.bfloat16))
+
+    def run(w, row_adapters, batch_adapters, nrows):
+        kv = fresh_pool(config, device)
+        seqs = [model.Sequence() for _ in range(nrows)]
+        steps = [torch.stack([model.forward_prefill(pre, w, config, cos, sin, kv, [s], row_adapters(j))[0, -1] for j, s in enumerate(seqs)])]
+        for t in dec:
+            tok = t.view(1, 1).expand(nrows, 1).contiguous()
+            steps.append(model.forward_decode(tok, w, config, cos, sin, kv, seqs, batch_adapters)[:, -1])
+        return torch.stack(steps).float()
+
+    batched = run(weights, lambda j: {n: (A[j:j+1], B[j:j+1]) for n, (A, B) in adapters.items()}, adapters, rows)
+    base = run(weights, lambda j: None, None, 1)[:, 0]
+    print(f"  {rows} rows, {len(adapters)} adapted matrices, rank 1, sigma {sigma}, {batched.shape[0]} positions")
+    for j in range(rows):
+        wj = dict(weights)
+        for n, (A, B) in adapters.items():
+            wj[n + ".weight"] = weights[n + ".weight"] + A[j] @ B[j].T
+        dense = run(wj, lambda _: None, None, 1)[:, 0]
+        err = (batched[:, j] - dense).abs()
+        effect = (base - dense).abs()
+        agree = (batched[:, j].argmax(-1) == dense.argmax(-1)).float().mean().item()
+        print(f"  row {j}  vs dense W+ABt: max {err.max():.3f} mean {err.mean():.4f} argmax {agree:.2f}"
+              f"   | perturbation effect: max {effect.max():.3f} mean {effect.mean():.4f}")
+        assert err.max() < MAX_BATCH_ABS_DIFF and err.mean() < effect.mean() / 5
+        del wj
+    torch.cuda.empty_cache()
+
+
 if __name__ == "__main__":
     snapshot_path = model.qwen0_5_snapshot_path
     device = "cuda"
@@ -2166,6 +2204,9 @@ if __name__ == "__main__":
 
     print("Stage 1 -- forward pass vs HuggingFace")
     check_forward_pass(snapshot_path, engine, device)
+
+    print("EGGROLL -- per-row low-rank adapters vs dense perturbed weights")
+    check_adapters(snapshot_path, engine, device)
 
     print("Stage 2 -- incremental decode vs single-pass prefill")
     check_incremental_decode(snapshot_path, engine, device)
