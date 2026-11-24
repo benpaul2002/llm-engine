@@ -62,6 +62,28 @@ def warmup(eng):
     sync()
 
 
+# ------------------------------------------------------- 0. hardware roofline
+def bench_roofline(copy_mib=1024, n=4096, reps=20):
+    """Measured ceilings for this GPU, not spec-sheet numbers.
+    Bandwidth: a device-to-device copy reads and writes every byte, so it
+    moves 2x the tensor size. Compute: an n x n x n bf16 matmul is 2n^3 FLOPs."""
+    src = torch.empty(copy_mib * 2**20, dtype=torch.uint8, device=DEV)
+    dst = torch.empty_like(src)
+    timed(lambda: dst.copy_(src), n=3)                      # warm-up
+    dt, _ = timed(lambda: dst.copy_(src), n=reps)
+    gb_per_s = 2 * src.numel() / dt / 1e9
+    del src, dst
+
+    a = torch.randn(n, n, dtype=torch.bfloat16, device=DEV)
+    b = torch.randn(n, n, dtype=torch.bfloat16, device=DEV)
+    timed(lambda: a @ b, n=3)                               # warm-up
+    dt, _ = timed(lambda: a @ b, n=reps)
+    tflops = 2 * n**3 / dt / 1e12
+    del a, b
+    torch.cuda.empty_cache()
+    return gb_per_s, tflops
+
+
 # ---------------------------------------------------------------- 1. TTFT
 def bench_ttft(eng, lengths):
     cfg, w, cos, sin = eng
@@ -146,6 +168,37 @@ def bench_itl(eng, batch_sizes, steps=32):
             sync()
             per_step.append((time.perf_counter() - t0) * 1000)
         out[b] = (statistics.median(per_step), statistics.median(per_step) / b)
+    return out
+
+
+def bench_scaling(eng, batch_sizes, ctx, gb_per_s, tflops, steps=16):
+    cfg, w, cos, sin = eng
+    params = sum(t.numel() for t in w.values())
+    kv_per_tok = cfg.num_hidden_layers * 2 * cfg.num_key_value_heads * cfg.head_dim * 2
+    out = {}
+    for b in batch_sizes:
+        kv = model.KVCache.preallocate(cfg, DEV, num_blocks=b * ((ctx + steps + 3) // 16 + 1))
+        seqs = []
+        for i in range(b):
+            s = Sequence()
+            model.forward_prefill(torch.tensor([fake_ids(ctx, seed=i)], device=DEV), w, cfg, cos, sin, kv, [s])
+            seqs.append(s)
+        tok = torch.full((b, 1), 100, device=DEV)
+        for _ in range(3):
+            model.forward_decode(tok, w, cfg, cos, sin, kv, seqs)
+        sync()
+        per_step = []
+        for _ in range(steps):
+            t0 = time.perf_counter()
+            model.forward_decode(tok, w, cfg, cos, sin, kv, seqs)
+            sync()
+            per_step.append((time.perf_counter() - t0) * 1000)
+        ms = statistics.median(per_step)
+        mem_ms = (params * 2 + b * ctx * kv_per_tok) / gb_per_s / 1e6
+        cmp_ms = b * 2 * params / tflops / 1e9
+        out[b] = (ms, max(mem_ms, cmp_ms), b / ms * 1000)
+        del kv, seqs
+        torch.cuda.empty_cache()
     return out
 
 

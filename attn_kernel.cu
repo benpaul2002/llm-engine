@@ -1,93 +1,91 @@
 #include <torch/torch.h>
 
-__global__ void attn_kernel(at::BFloat16* q, at::BFloat16* kpool, at::BFloat16* vpool, float* scores, float* part_out, float* part_max, float* part_sum, int* table, int* lengths, int max_blocks, int block_size, int max_len, int num_q_heads, int num_kv_heads, int head_dim, int num_splits) {
+template <int HD>
+__global__ void attn_kernel(at::BFloat16* q, at::BFloat16* kpool, at::BFloat16* vpool, float* part_out, float* part_max, float* part_sum, int* table, int* lengths, int max_blocks, int block_size, int num_q_heads, int num_kv_heads, int num_splits) {
+    constexpr int TILE = 4096 / HD;
+    constexpr int VEC = 8;
+    constexpr int CHUNKS = HD / VEC;
+    int group = num_q_heads / num_kv_heads;
+
+    extern __shared__ float smem[];
+    float* ks = smem;
+    float* vs = ks + TILE * (HD + 1);
+    float* qs = vs + TILE * HD;
+    float* sc = qs + group * HD;
+    int* base = (int*)(sc + group * TILE);
+
     int p = blockIdx.x / num_splits;
     int split = blockIdx.x % num_splits;
-    int slot = p*num_splits + split;
-    int i = threadIdx.x;
-    if(i>=head_dim) {
-        return;
-    }
-
-    int seq = p/num_q_heads;
-    int q_head = p%num_q_heads;
-    int kv_head = q_head/(num_q_heads/num_kv_heads);
+    int seq = p / num_kv_heads;
+    int kv_head = p % num_kv_heads;
+    int g = threadIdx.x / HD;
+    int i = threadIdx.x % HD;
+    int qp = seq * num_q_heads + kv_head * group + g;
 
     int l = lengths[seq];
-    q += p*head_dim;
-    scores += p*max_len;
-
     int chunk = (l + num_splits - 1) / num_splits;
     int start = split * chunk;
     int end = min(start + chunk, l);
 
-    __shared__ float partial[128];
+    float* myq = qs + g * HD;
+    float* mysc = sc + g * TILE;
+    myq[i] = (float)q[qp * HD + i];
+    float m = -INFINITY, lsum = 0, acc = 0;
 
-    int warp = threadIdx.x / 32;
-    int lane = threadIdx.x % 32;
-    int num_warps = head_dim/32;
-    for(int t=start+warp; t<end; t+=num_warps) {
-        float val = 0;
-        int cache_block = table[seq*max_blocks + t/block_size];
-        int slot = t % block_size;
-        for(int d=lane; d<head_dim; d+=32) {
-            val += (float)q[d] * (float)kpool[((cache_block*block_size + slot)*num_kv_heads + kv_head)*head_dim + d];
+    for (int t0 = start; t0 < end; t0 += TILE) {
+        int n = min(TILE, end - t0);
+        if (threadIdx.x < n) {
+            int t = t0 + threadIdx.x;
+            base[threadIdx.x] = ((table[seq * max_blocks + t / block_size] * block_size + t % block_size) * num_kv_heads + kv_head) * HD;
         }
-        for(int offset=16; offset>=1; offset/=2) {
-            val += __shfl_down_sync(0xffffffff, val, offset);
-        }   
-        if(lane==0) {
-            scores[t] = val/sqrtf(head_dim);
-        }
-    }
-    __syncthreads();
-
-    float imax = -INFINITY;
-    for (int t=start+i; t<end; t+=head_dim) {
-        imax = fmaxf(imax, scores[t]);
-    }
-    partial[i] = imax;
-    for(int j=head_dim/2; j>=1; j/=2) {
         __syncthreads();
-        if(i<j) {
-            partial[i] = fmaxf(partial[i], partial[i+j]);
-        }
-    }
-    __syncthreads();
 
-    imax = partial[0];
-    __syncthreads();
-    float sum = 0;
-    for(int t=start+i; t<end; t+=head_dim) {
-        sum += expf(scores[t]-imax);
-    }
-    partial[i] = sum;
-    for(int j=head_dim/2; j>=1; j/=2) {
+        for (int u = threadIdx.x; u < n * CHUNKS; u += blockDim.x) {
+            int tt = u / CHUNKS;
+            int c = (u % CHUNKS) * VEC;
+            uint4 kraw = *(uint4*)(kpool + base[tt] + c);
+            uint4 vraw = *(uint4*)(vpool + base[tt] + c);
+            at::BFloat16* ke = (at::BFloat16*)&kraw;
+            at::BFloat16* ve = (at::BFloat16*)&vraw;
+            for (int j = 0; j < VEC; j++) {
+                ks[tt * (HD + 1) + c + j] = (float)ke[j];
+                vs[tt * HD + c + j] = (float)ve[j];
+            }
+        }
         __syncthreads();
-        if(i<j) {
-            partial[i] += partial[i+j];
+
+        float s = 0;
+        if (i < n) {
+            for (int d = 0; d < HD; d++) s += myq[d] * ks[i * (HD + 1) + d];
+            s = s / sqrtf(HD);
+            mysc[i] = s;
         }
-    }
-    __syncthreads();
+        __syncthreads();
 
-    sum = partial[0];
-    __syncthreads();
-    for(int t=start+i; t<end; t+=head_dim) {
-        scores[t] = expf(scores[t]-imax);
-    }
-    
-    __syncthreads();
-    float acc = 0;
-    for(int t=start; t<end; t++) {
-        int cache_block = table[seq*max_blocks + t/block_size];
-        int slot = t % block_size;
-        acc += scores[t] * vpool[((cache_block*block_size + slot)*num_kv_heads + kv_head)*head_dim + i];
-    }
-    part_out[slot*head_dim + i] = acc;
+        float mt = m;
+        for (int t = 0; t < n; t++) mt = fmaxf(mt, mysc[t]);
+        __syncthreads();
 
-    if(i==0) {
-        part_max[slot] = imax;
-        part_sum[slot] = sum;
+        if (i < n) mysc[i] = expf(s - mt);
+        __syncthreads();
+
+        float corr = expf(m - mt);
+        lsum *= corr;
+        acc *= corr;
+        for (int t = 0; t < n; t++) {
+            float pt = mysc[t];
+            lsum += pt;
+            acc += pt * vs[t * HD + i];
+        }
+        m = mt;
+        __syncthreads();
+    }
+
+    int slot = qp * num_splits + split;
+    part_out[slot * HD + i] = acc;
+    if (i == 0) {
+        part_max[slot] = m;
+        part_sum[slot] = lsum;
     }
 }
 
@@ -108,25 +106,31 @@ __global__ void combine_kernel(float* part_out, float* part_max, float* part_sum
     out[p*head_dim + i] = o/total;
 }
 
+template <int HD>
+void launch(torch::Tensor q, torch::Tensor kpool, torch::Tensor vpool, torch::Tensor table, torch::Tensor lengths, torch::Tensor part_out, torch::Tensor part_max, torch::Tensor part_sum, int num_splits) {
+    constexpr int TILE = 4096 / HD;
+    int num_q_heads = q.size(1);
+    int num_kv_heads = kpool.size(2);
+    int group = num_q_heads / num_kv_heads;
+    int num_seqs = lengths.size(0);
+    int smem = (TILE * (HD + 1) + TILE * HD + group * HD + group * TILE + TILE) * 4;
+    attn_kernel<HD><<<num_seqs * num_kv_heads * num_splits, group * HD, smem>>>(q.data_ptr<at::BFloat16>(), kpool.data_ptr<at::BFloat16>(), vpool.data_ptr<at::BFloat16>(), part_out.data_ptr<float>(), part_max.data_ptr<float>(), part_sum.data_ptr<float>(), table.data_ptr<int>(), lengths.data_ptr<int>(), table.size(1), kpool.size(1), num_q_heads, num_kv_heads, num_splits);
+}
+
 void attention(torch::Tensor q, torch::Tensor kpool, torch::Tensor vpool, torch::Tensor table, torch::Tensor lengths, torch::Tensor out) {
     TORCH_CHECK(kpool.size(3)==64 || kpool.size(3)==128, "kernel assumes head_dim == 64 or 128");
 
-    int block_size = kpool.size(1);
-    int num_kv_heads = kpool.size(2);
     int head_dim = kpool.size(3);
     int num_q_heads = q.size(1);
     int num_seqs = lengths.size(0);
-    int max_blocks = table.size(1);
-    int max_len = max_blocks * block_size;
-
     int num_splits = 4;
 
-    auto scores = torch::empty({num_seqs * num_q_heads * max_len}, q.options().dtype(torch::kFloat32));
     auto part_out = torch::empty({num_seqs * num_q_heads * num_splits * head_dim}, q.options().dtype(torch::kFloat32));
     auto part_max = torch::empty({num_seqs * num_q_heads * num_splits}, q.options().dtype(torch::kFloat32));
     auto part_sum = torch::empty({num_seqs * num_q_heads * num_splits}, q.options().dtype(torch::kFloat32));
 
-    attn_kernel<<<num_seqs * num_q_heads * num_splits, head_dim>>>(q.data_ptr<at::BFloat16>(), kpool.data_ptr<at::BFloat16>(), vpool.data_ptr<at::BFloat16>(), scores.data_ptr<float>(), part_out.data_ptr<float>(), part_max.data_ptr<float>(), part_sum.data_ptr<float>(), table.data_ptr<int>(), lengths.data_ptr<int>(), max_blocks, block_size, max_len, num_q_heads, num_kv_heads, head_dim, num_splits);
+    if (head_dim == 64) launch<64>(q, kpool, vpool, table, lengths, part_out, part_max, part_sum, num_splits);
+    else launch<128>(q, kpool, vpool, table, lengths, part_out, part_max, part_sum, num_splits);
 
     combine_kernel<<<num_seqs * num_q_heads, head_dim>>> (part_out.data_ptr<float>(), part_max.data_ptr<float>(), part_sum.data_ptr<float>(), out.data_ptr<at::BFloat16>(), head_dim, num_splits);
 }

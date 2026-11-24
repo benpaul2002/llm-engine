@@ -52,8 +52,10 @@ class KVCache:
     stats: CacheStats = field(default_factory=CacheStats)
 
     @classmethod
-    def preallocate(cls, config, device):
+    def preallocate(cls, config, device, num_blocks=None):
         cache = cls()
+        if num_blocks is not None:
+            cache.num_blocks = num_blocks
         for i in range(config.num_hidden_layers):
             cache.k.append(torch.empty(cache.num_blocks, cache.block_size, config.num_key_value_heads, config.head_dim, dtype=torch.bfloat16, device=device))
             cache.v.append(torch.empty(cache.num_blocks, cache.block_size, config.num_key_value_heads, config.head_dim, dtype=torch.bfloat16, device=device))
